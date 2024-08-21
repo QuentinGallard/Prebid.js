@@ -5,9 +5,15 @@ import {registerBidder} from '../src/adapters/bidderFactory.js';
 import {BANNER, NATIVE, VIDEO} from '../src/mediaTypes.js';
 import {INSTREAM, OUTSTREAM} from '../src/video.js';
 import {serializeSupplyChain} from '../libraries/schainSerializer/schainSerializer.js'
+import {ortbConverter} from '../libraries/ortbConverter/converter.js'
 import {convertOrtbRequestToProprietaryNative, toOrtbNativeRequest, toLegacyResponse} from '../src/native.js';
 
 const BIDDER_CODE = 'smilewanted';
+const SMILEWANTED_ENDPOINT = 'https://prebid.smilewanted.com';
+const SMILEWANTED_CSYNC_URL = 'https://csync.smilewanted.com';
+const GVL_ID = 639;
+const CURRENCY = 'EUR';
+const TTL = 300;
 
 /**
  * @typedef {import('../src/adapters/bidderFactory.js').BidRequest} BidRequest
@@ -17,8 +23,6 @@ const BIDDER_CODE = 'smilewanted';
  * @typedef {import('../src/adapters/bidderFactory.js').SyncOptions} SyncOptions
  * @typedef {import('../src/adapters/bidderFactory.js').UserSync} UserSync
  */
-
-const GVL_ID = 639;
 
 export const spec = {
   code: BIDDER_CODE,
@@ -53,6 +57,29 @@ export const spec = {
     return true;
   },
 
+  buildOrtbRequests(bidRequests, bidderRequest) {
+    let requests = [];
+
+    // Utiliser getFloor
+
+    const videoBids = bidRequests.filter(bid => deepAccess(bid, 'mediaTypes.video'));
+    videoBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, VIDEO));
+    });
+
+    const nativeBids = bidRequests.filter(bid => deepAccess(bid, 'mediaTypes.native'));
+    nativeBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, NATIVE));
+    });
+
+    const bannerBids = bidRequests.filter(bid => !deepAccess(bid, 'mediaTypes.video') && !deepAccess(bid, 'mediaTypes.native'));
+    bannerBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, BANNER));
+    });
+
+    return requests;
+  },
+
   /**
    * Make a server request from the list of BidRequests.
    *
@@ -66,7 +93,7 @@ export const spec = {
     return validBidRequests.map(bid => {
       const payload = {
         zoneId: bid.params.zoneId,
-        currencyCode: config.getConfig('currency.adServerCurrency') || 'EUR',
+        currencyCode: config.getConfig('currency.adServerCurrency') || CURRENCY,
         tagId: bid.adUnitCode,
         sizes: bid.sizes.map(size => ({
           w: size[0],
@@ -86,7 +113,6 @@ export const spec = {
         prebidVersion: '$prebid.version$',
         schain: serializeSupplyChain(bid.schain, ['asi', 'sid', 'hp', 'rid', 'name', 'domain', 'ext']),
       };
-
       const floor = getBidFloor(bid);
       if (floor) {
         payload.bidfloor = floor;
@@ -133,7 +159,7 @@ export const spec = {
       const payloadString = JSON.stringify(payload);
       return {
         method: 'POST',
-        url: 'https://prebid.smilewanted.com',
+        url: SMILEWANTED_ENDPOINT,
         data: payloadString,
       };
     });
@@ -202,6 +228,17 @@ export const spec = {
     return bidResponses;
   },
 
+
+  /**
+   * Unpack the response from the server into a list of bids.
+   *
+   * @param {ServerResponse} serverResponse A successful response from the server.
+   * @param {BidRequest} bidRequest
+   * @return {Bid[]} An array of bids which were nested inside the server.
+   */
+  interpretOrtbResponse: function(serverResponse, bidRequest) {
+    return CONVERTER.fromORTB({request: bidRequest, response: serverResponse.body}).bids;
+  },
   /**
    * Register the user sync pixels which should be dropped after the auction.
    *
@@ -234,13 +271,13 @@ export const spec = {
 
       syncs.push({
         type: 'iframe',
-        url: 'https://csync.smilewanted.com' + paramsStr
+        url: SMILEWANTED_CSYNC_URL + paramsStr
       });
     }
 
     return syncs;
   }
-}
+};
 
 /**
  * Create SmileWanted renderer
@@ -278,24 +315,137 @@ function outstreamRender(bid) {
   });
 }
 
+export const CONVERTER = ortbConverter({
+  context: {
+    netRevenue: true,
+    ttl: TTL,
+    currency: CURRENCY
+  },
+  imp(buildImp, bidRequest, context) {
+    const imp = buildImp(bidRequest, context);
+    imp.bidfloorcur = context.currencyCode;
+    // TODO : utiliser getBidFloor ?
+    const bidfloor = bidRequest.params.bidfloor || 0;
+    if (0 != bidfloor) {
+      imp.bidfloor = bidfloor;
+    }
+
+    imp.ext.bidder = {zoneId: bidRequest.params.zoneId};
+    if (deepAccess(bidRequest, 'adUnitCode')) {
+      imp.tagid = bidRequest.adUnitCode;
+    }
+
+    if (context.mediaType === BANNER && bidRequest.mediaTypes?.banner === undefined && bidRequest.sizes) {
+      imp.banner = {
+        format: bidRequest.sizes.map(size => ({ w: size[0], h: size[1] }))
+      };
+    }
+
+    if (context.mediaType === VIDEO) {
+      const videoContext = deepAccess(bidRequest, 'mediaTypes.video.context');
+      if (videoContext) {
+        let videoExt = deepAccess(imp, 'video.ext');
+        if (!videoExt) {
+          imp.video.ext = {};
+        }
+        imp.video.ext.context = videoContext;
+      }
+    }
+
+    return imp;
+  },
+  request(buildRequest, imps, bidderRequest, context) {
+    const request = buildRequest(imps, bidderRequest, context);
+    const bidRequest = context.bidRequests[0];
+
+    // PrebidJs Version and timeout
+    request.ext = {prebidVersion: '$prebid.version$'};
+    if (deepAccess(bidRequest, 'timeout')) {
+      request.tmax = bidRequest.timeout;
+    }
+
+    // PositionType
+    if (deepAccess(bidRequest, 'params.positionType')) {
+      request.ext.positionType = bidRequest?.params?.positionType;
+    }
+
+    // External Ids
+    if (deepAccess(bidRequest, 'userIdAsEids')) {
+      if (!deepAccess(bidRequest, 'user.ext')) {
+        request.user = {ext:{}};
+      }
+      request.user.ext.eids = bidRequest.userIdAsEids;
+    }
+
+    // get the referer via refererInfo.page
+    if (!deepAccess(bidderRequest, 'ortb2.site.page') && deepAccess(bidderRequest, 'refererInfo.page')) {
+      if (!deepAccess(request, 'site')) {
+        request.site = {};
+      }
+
+      request.site.page = deepAccess(bidderRequest, 'refererInfo.page');
+    }
+
+    // GDPR
+    if (deepAccess(bidderRequest, 'gdprConsent')) {
+      if (deepAccess(bidderRequest, 'gdprConsent.consentString')) {
+        if (!deepAccess(bidRequest, 'user.ext')) {
+          request.user = {ext: {}};
+        }
+        request.user.ext.consent = bidderRequest.gdprConsent.consentString;
+      }
+
+      const gdprApplies = deepAccess(bidderRequest, 'gdprConsent.gdprApplies');
+      if (gdprApplies) {
+        if (!deepAccess(bidRequest, 'regs')) {
+          request.regs = {ext: {}};
+        }
+        request.regs.ext.gdpr = gdprApplies;
+      }
+    }
+
+    return request;
+  }
+});
+
 /**
  * Get the floor price from bid.params for backward compatibility.
  * If not found, then check floor module.
  * @param bid A valid bid object
+ * @param mediaType string
  * @returns {*|number} floor price
  */
-function getBidFloor(bid) {
+function getBidFloor(bid, mediaType) {
   if (isFn(bid.getFloor)) {
     const floorInfo = bid.getFloor({
-      currency: 'USD',
-      mediaType: 'banner',
+      currency: CURRENCY,
+      mediaType: mediaType || BANNER,
       size: bid.sizes.map(size => ({ w: size[0], h: size[1] }))
     });
-    if (isPlainObject(floorInfo) && !isNaN(floorInfo.floor) && floorInfo.currency === 'USD') {
+    if (isPlainObject(floorInfo) && !isNaN(floorInfo.floor) && floorInfo.currency === CURRENCY) {
       return parseFloat(floorInfo.floor);
     }
   }
   return null;
+}
+
+function createRequest(bidRequests, bidderRequest, mediaType) {
+  const context = {
+    mediaType: mediaType,
+    currencyCode: config.getConfig('currency.adServerCurrency') || CURRENCY
+  };
+
+  const data = CONVERTER.toORTB({
+    bidRequests,
+    bidderRequest,
+    context,
+  })
+
+  return {
+    method: 'POST',
+    url: SMILEWANTED_ENDPOINT,
+    data: data,
+  };
 }
 
 registerBidder(spec);
