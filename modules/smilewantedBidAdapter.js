@@ -1,13 +1,19 @@
-import {deepAccess, deepClone, isArray, isFn, isPlainObject, logError, logWarn} from '../src/utils.js';
+import {deepAccess, deepClone, deepSetValue, isArray, isFn, isPlainObject, logError, logWarn} from '../src/utils.js';
 import {Renderer} from '../src/Renderer.js';
 import {config} from '../src/config.js';
 import {registerBidder} from '../src/adapters/bidderFactory.js';
 import {BANNER, NATIVE, VIDEO} from '../src/mediaTypes.js';
 import {INSTREAM, OUTSTREAM} from '../src/video.js';
 import {serializeSupplyChain} from '../libraries/schainSerializer/schainSerializer.js'
+import {ortbConverter} from '../libraries/ortbConverter/converter.js'
 import {convertOrtbRequestToProprietaryNative, toOrtbNativeRequest, toLegacyResponse} from '../src/native.js';
+import * as utils from "../src/utils";
 
 const BIDDER_CODE = 'smilewanted';
+const SMILEWANTED_ENDPOINT = 'https://prebid.smilewanted.com';
+const GVL_ID = 639;
+const CURRENCY = 'EUR';
+const TTL = 300; // TODO
 
 /**
  * @typedef {import('../src/adapters/bidderFactory.js').BidRequest} BidRequest
@@ -17,8 +23,6 @@ const BIDDER_CODE = 'smilewanted';
  * @typedef {import('../src/adapters/bidderFactory.js').SyncOptions} SyncOptions
  * @typedef {import('../src/adapters/bidderFactory.js').UserSync} UserSync
  */
-
-const GVL_ID = 639;
 
 export const spec = {
   code: BIDDER_CODE,
@@ -53,7 +57,33 @@ export const spec = {
     return true;
   },
 
+  buildOrtbRequests(bidRequests, bidderRequest) {
+    let requests = [];
+
+    // Videos
+    const videoBids = bidRequests.filter(bid => isVideoBid(bid));
+    videoBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, VIDEO));
+    });
+
+    // Natives
+    const nativeBids = bidRequests.filter(bid => isNativeBid(bid));
+    nativeBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, NATIVE));
+    });
+
+    // Banner
+    const bannerBids = bidRequests.filter(bid => !isVideoBid(bid) && !isNativeBid(bid));
+    bannerBids.forEach(bid => {
+      requests.push(createRequest([bid], bidderRequest, BANNER));
+    });
+
+    return requests;
+  },
+
   /**
+   * CURRENTLY NOT USED
+   *
    * Make a server request from the list of BidRequests.
    *
    * @param {BidRequest[]} validBidRequests A non-empty list of valid bid requests that should be sent to the Server.
@@ -66,7 +96,7 @@ export const spec = {
     return validBidRequests.map(bid => {
       const payload = {
         zoneId: bid.params.zoneId,
-        currencyCode: config.getConfig('currency.adServerCurrency') || 'EUR',
+        currencyCode: config.getConfig('currency.adServerCurrency') || CURRENCY,
         tagId: bid.adUnitCode,
         sizes: bid.sizes.map(size => ({
           w: size[0],
@@ -86,7 +116,6 @@ export const spec = {
         prebidVersion: '$prebid.version$',
         schain: serializeSupplyChain(bid.schain, ['asi', 'sid', 'hp', 'rid', 'name', 'domain', 'ext']),
       };
-
       const floor = getBidFloor(bid);
       if (floor) {
         payload.bidfloor = floor;
@@ -133,13 +162,15 @@ export const spec = {
       const payloadString = JSON.stringify(payload);
       return {
         method: 'POST',
-        url: 'https://prebid.smilewanted.com',
+        url: SMILEWANTED_ENDPOINT,
         data: payloadString,
       };
     });
   },
 
   /**
+   * CURRENTLY NOT USED
+   *
    * Unpack the response from the server into a list of bids.
    *
    * @param {ServerResponse} serverResponse A successful response from the server.
@@ -203,6 +234,8 @@ export const spec = {
   },
 
   /**
+   * CURRENTLY NOT USED
+   *
    * Register the user sync pixels which should be dropped after the auction.
    *
    * @param {SyncOptions} syncOptions Which user syncs are allowed?
@@ -278,24 +311,106 @@ function outstreamRender(bid) {
   });
 }
 
+const converter = ortbConverter({
+  context: {
+    netRevenue: true, // TODO
+    ttl: TTL,
+    currency: CURRENCY
+  },
+  imp(buildImp, bidRequest, context) {
+    const imp = buildImp(bidRequest, context);
+    const bidfloor = bidRequest.params.bidfloor || 0;
+    if (0 != bidfloor) {
+      imp.bidfloor = bidfloor;
+      imp.bidfloorcur = context.currencyCode;
+    }
+
+    imp.ext.bidder = bidRequest.params.zoneId;
+    if (bidRequest.adUnitCode !== undefined) {
+      imp.ext.data = {pbadslot: bidRequest.adUnitCode};
+    }
+    return imp;
+  },
+  request(buildRequest, imps, bidderRequest, context) {
+    const request = buildRequest(imps, bidderRequest, context);
+    const bidRequest = context.bidRequests[0];
+
+    request.ext = {prebidVersion: '$prebid.version$'};
+    if (bidRequest.timeout !== undefined) {
+      request.tmax = bidRequest.timeout;
+    }
+
+    request.positionType = bidRequest?.params?.positionType || '';
+
+    const bidSchain = bidRequest?.schain;
+    if (bidSchain !== undefined) {
+      if (request.source.ext === undefined) {
+        request.source.ext = {};
+      }
+      request.source.ext.schain = bidSchain;
+    }
+
+    if (bidderRequest?.gdprConsent) {
+      if (request?.user === undefined) {
+        request.user = {ext:{}};
+      }
+      request.user.ext.consent = bidderRequest.gdprConsent.consentString;
+
+      if (request.regs === undefined) {
+        request.regs = {ext: {}};
+      }
+      request.regs.ext.gdpr = bidderRequest.gdprConsent.gdprApplies; // we're handling the undefined case server side
+    }
+
+    return request;
+  }
+});
+
 /**
  * Get the floor price from bid.params for backward compatibility.
  * If not found, then check floor module.
  * @param bid A valid bid object
+ * @param mediaType string
  * @returns {*|number} floor price
  */
-function getBidFloor(bid) {
+function getBidFloor(bid, mediaType) {
   if (isFn(bid.getFloor)) {
     const floorInfo = bid.getFloor({
-      currency: 'USD',
-      mediaType: 'banner',
+      currency: CURRENCY,
+      mediaType: mediaType || BANNER,
       size: bid.sizes.map(size => ({ w: size[0], h: size[1] }))
     });
-    if (isPlainObject(floorInfo) && !isNaN(floorInfo.floor) && floorInfo.currency === 'USD') {
+    if (isPlainObject(floorInfo) && !isNaN(floorInfo.floor) && floorInfo.currency === CURRENCY) {
       return parseFloat(floorInfo.floor);
     }
   }
   return null;
+}
+
+function createRequest(bidRequests, bidderRequest, mediaType) {
+  const context = {
+    mediaType: mediaType,
+    currencyCode: config.getConfig('currency.adServerCurrency') || CURRENCY
+  };
+
+  return {
+    method: 'POST',
+    url: SMILEWANTED_ENDPOINT,
+    data: converter.toORTB({
+      bidRequests,
+      bidderRequest,
+      context,
+    }),
+  };
+}
+
+
+function isVideoBid(bid) {
+  return utils.deepAccess(bid, 'mediaTypes.video');
+}
+
+function isNativeBid(bid) {
+  return utils.deepAccess(bid, 'mediaTypes.native');
 }
 
 registerBidder(spec);
